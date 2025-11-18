@@ -347,65 +347,71 @@ async def faq_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     key = query.data
 
-    if key == "HELP_MENU" or key == "FAQ_CLOSE":
-        # show help menu or close
-        if key == "HELP_MENU":
-            await query.edit_message_text("📘 *NyayaAI Help Menu*\n\nChoose an item to learn more (press buttons).", parse_mode="Markdown", reply_markup=build_faq_keyboard())
-        else:
-            await query.edit_message_text("Closed help menu.")
+    if key == "HELP_MENU":
+        await query.edit_message_text(
+            "📘 *NyayaAI Help Menu*\n\nChoose an item to learn more (press buttons).",
+            parse_mode="Markdown",
+            reply_markup=build_faq_keyboard()
+        )
+        return
+
+    if key == "FAQ_CLOSE":
+        await query.edit_message_text("Closed help menu.")
         return
 
     if key == "FAQ_CAPABILITIES":
         text = (
             "*What NyayaAI can do:*\n"
             "- Search Supreme/High Court judgments\n"
-            "- Summarize judgments + give a relevance score\n"
-            "- Extract ILAC notes and arguments\n"
-            "- Extract citations\n"
-            "- Compare your query with judgments (/compare)\n"
+            "- Summaries + relevance scores\n"
+            "- ILAC notes & arguments\n"
+            "- Citations\n"
+            "- Compare cases (/compare)\n"
             "- Extract legal issues (/issues)\n"
-            "- Generate PDF research reports (/pdf)\n"
+            "- Generate PDF reports (/pdf)\n"
+            "- Process FIR PDFs (/uploadfir)\n"
         )
+
     elif key == "FAQ_FIR":
         text = (
             "*FIR → Query:* Reply to a FIR PDF with `/uploadfir`.\n"
-            "NyayaAI will extract text, create a search query, find cases, summarize, and build a PDF."
+            "NyayaAI will generate the best legal search query and full research report."
         )
+
     elif key == "FAQ_PDF":
         text = (
-            "*Generating PDFs:* Use `/pdf <query>`.\n"
-            "Example: `/pdf IPC 302 murder knife attack`\n"
-            "Bot will search, summarize top cases, create ILAC, arguments, citations, and return a PDF."
+            "*PDF Reports:*\n"
+            "Use `/pdf <query>`.\n"
+            "Example: `/pdf IPC 302 murder`\n"
+            "NyayaAI will summarize top cases, ILAC, arguments & citations."
         )
+
     elif key == "FAQ_ACCURACY":
         text = (
-            "*About accuracy:*\n"
-            "- Summaries are AI-generated and meant to assist legal research.\n"
-            "- Use them as a starting point; always verify quotations and citations using the original judgment link."
+            "*About Accuracy:*\n"
+            "Summaries & relevance scores are AI-generated and intended to support legal research."
         )
+
     elif key == "FAQ_PRICING":
         text = (
-            "*Pricing & limits:*\n"
-            "- This demo has limited quota. For production, pricing tiers can include monthly plans, pay-per-report, or enterprise licensing."
+            "*Pricing:* Premium plans can include daily limits, report credits, or monthly subscriptions."
         )
- elif key == "FAQ_CONTACT":
-    text = (
-        "*Contact / Feedback*\n"
-        "📨 Email: **zoebsadeqa@gmail.com**\n"
-        "🕒 Response time: 24 hours\n"
-        "\n"
-        "Feel free to report bugs, suggest features, or request custom legal AI tools."
-    )
+
+    elif key == "FAQ_CONTACT":
+        text = (
+            "*Contact / Feedback:*\n"
+            "Email: zoebsadeqa@gmail.com"
+        )
+
     else:
         text = "Unknown item."
 
-    # show answer with a back button
-    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="HELP_MENU"), InlineKeyboardButton("Close", callback_data="FAQ_CLOSE")]])
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb)
-    except Exception:
-        # fallback: send new message
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_kb)
+    back_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Back", callback_data="HELP_MENU"),
+         InlineKeyboardButton("Close", callback_data="FAQ_CLOSE")]
+    ])
+
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb)
 
 # ---------------------------
 # /pdf command
