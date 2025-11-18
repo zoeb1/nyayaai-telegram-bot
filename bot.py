@@ -1,3 +1,4 @@
+# version 1.1
 # PART 1/4: Imports, config, utilities
 import os
 import re
