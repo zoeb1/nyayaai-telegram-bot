@@ -19,9 +19,6 @@ from telegram.ext import (
 )
 
 from openai import OpenAI
-from dotenv import load_dotenv
-load_dotenv()
-
 
 # ---------------------------
 # Load API keys
