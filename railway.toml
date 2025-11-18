@@ -1,0 +1,5 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+start = "python3 bot.py"
