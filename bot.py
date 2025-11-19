@@ -25,6 +25,13 @@ from telegram.ext import (
 
 from openai import OpenAI
 
+print("ENV DEBUG:")
+print("GOOGLE_API_KEY =", os.getenv("GOOGLE_API_KEY"))
+print("GOOGLE_CSE_ID =", os.getenv("GOOGLE_CSE_ID"))
+print("TELEGRAM_TOKEN =", os.getenv("TELEGRAM_TOKEN"))
+print("------------------------------")
+
+
 # ============================
 # LOAD ENV VARIABLES
 # ============================
