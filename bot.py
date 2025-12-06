@@ -25,8 +25,6 @@ except Exception:
 # core libs
 import requests
 from bs4 import BeautifulSoup
-import fitz  # PyMuPDF (pdf text extraction)
-import pdfkit
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -53,6 +51,12 @@ WEBSHARE_USERNAME = os.getenv("WEBSHARE_USERNAME")
 WEBSHARE_PASSWORD = os.getenv("WEBSHARE_PASSWORD")
 ENABLE_PROXY = os.getenv("ENABLE_PROXY", "false").lower() in ("1", "true", "yes")
 
+# Optional manual proxy pool (comma-separated list of proxy URLs, e.g. 100 static proxies)
+# Example:
+# PROXY_LIST="http://user:pass@ip1:port,http://user:pass@ip2:port,..."
+PROXY_LIST = os.getenv("PROXY_LIST", "")
+PROXY_POOL = [p.strip() for p in PROXY_LIST.split(",") if p.strip()]
+
 # ========== OpenAI client ==========
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY not set — OpenAI calls will fail.")
@@ -75,7 +79,7 @@ logger = logging.getLogger("NyayaAI")
 logger.info("NyayaAI starting...")
 
 # ========== Usage & Snapshot ==========
-USAGE: Dict[str, Any] = {"messages": 0, "unique_users": set(), "pdfs": 0, "commands": {}}
+USAGE: Dict[str, Any] = {"messages": 0, "unique_users": set(), "commands": {}}
 USAGE_LOCK = threading.Lock()
 USAGE_FILE = LOG_DIR / "usage.json"
 
@@ -96,7 +100,6 @@ def snapshot_usage_daemon():
                 snapshot = {
                     "messages": USAGE["messages"],
                     "unique_users": len(USAGE["unique_users"]),
-                    "pdfs": USAGE["pdfs"],
                     "commands": USAGE["commands"],
                 }
             USAGE_FILE.write_text(json.dumps(snapshot, indent=2))
@@ -113,7 +116,12 @@ async def safe_send(bot, chat_id, text, parse_mode=None, reply_markup=None):
     """
     for attempt in range(3):
         try:
-            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
         except Exception as e:
             # common issues: RetryAfter, TimedOut, BadRequest etc.
             logger.warning("safe_send attempt %s failed: %s", attempt + 1, e)
@@ -123,14 +131,21 @@ async def safe_send(bot, chat_id, text, parse_mode=None, reply_markup=None):
 
 async def safe_edit(bot, chat_id, message_id, text, parse_mode=None, reply_markup=None):
     try:
-        return await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
     except Exception as e:
         logger.warning("safe_edit failed: %s", e)
         return None
 
 # small helper to chunk long texts for Telegram
 def chunk_text(s: str, chunk_size: int = 3500) -> List[str]:
-    return [s[i:i+chunk_size] for i in range(0, len(s), chunk_size)]
+    return [s[i:i + chunk_size] for i in range(0, len(s), chunk_size)]
+
 # ---------------- PART 2 ----------------
 # NyayaAI — Part 2: search stack, proxy, caching, scrapers, fetch_case_text
 # ----------------
@@ -173,29 +188,56 @@ def get_rotating_proxy_url() -> str:
     proxy_user = f"{WEBSHARE_USERNAME}-session-{session_id}"
     return f"http://{proxy_user}:{WEBSHARE_PASSWORD}@p.webshare.io:80"
 
-def safe_request(url: str, timeout: int = 20, allow_proxy_for: List[str] = None, **kwargs):
+def safe_request(
+    url: str,
+    timeout: int = 20,
+    allow_proxy_for: List[str] = None,
+    **kwargs,
+):
     """
-    Wrapper that attempts proxy request first (if enabled), falls back to direct.
-    allow_proxy_for: list of substrings; proxy used only when any substring in url.
+    Wrapper that tries:
+      1) Webshare rotating proxy (if enabled),
+      2) Static proxy pool (PROXY_POOL, up to 100 proxies),
+      3) Direct request (no proxy),
+    in that order, with graceful fallback.
     """
     headers = kwargs.pop("headers", {"User-Agent": "Mozilla/5.0 (NyayaAI)"})
-    proxies = None
-    try:
-        proxy_url = get_rotating_proxy_url()
-        allow = True
-        if allow_proxy_for:
-            allow = any(pat in url.lower() for pat in allow_proxy_for)
-        if proxy_url and allow:
-            proxies = {"http": proxy_url, "https": proxy_url}
-            resp = requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
-            resp.raise_for_status()
-            return resp
-    except Exception as e:
-        logger.warning("Proxy failed for %s. Retrying without proxy. (%s)", url, e)
-    # fallback direct
+
+    allow = True
+    if allow_proxy_for:
+        allow = any(pat in url.lower() for pat in allow_proxy_for)
+
+    # Build proxy candidate list
+    candidates: List[str] = []
+    ws = get_rotating_proxy_url()
+    if ws:
+        candidates.append(ws)
+    if PROXY_POOL:
+        # extend with your static proxies (already parsed in Part 1)
+        candidates.extend(PROXY_POOL)
+
+    # Deduplicate while preserving order
+    seen = set()
+    candidates = [p for p in candidates if not (p in seen or seen.add(p))]
+
+    # Try proxies (if allowed for this URL)
+    if allow and candidates:
+        # randomize order to distribute load
+        for candidate in random.sample(candidates, k=len(candidates)):
+            try:
+                proxies = {"http": candidate, "https": candidate}
+                resp = requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
+                resp.raise_for_status()
+                logger.info("safe_request: succeeded via proxy %s for %s", candidate, url)
+                return resp
+            except Exception as e:
+                logger.warning("Proxy %s failed for %s (%s)", candidate, url, e)
+
+    # Fallback: direct request
     try:
         resp = requests.get(url, headers=headers, timeout=timeout)
         resp.raise_for_status()
+        logger.info("safe_request: succeeded directly for %s", url)
         return resp
     except Exception as e:
         logger.exception("Direct request failed for %s: %s", url, e)
@@ -211,7 +253,12 @@ def google_legal_search(query: str, max_results: int = 5) -> List[str]:
     if cached:
         return cached
     url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": f"{query} judgment case law", "num": min(max_results, 10)}
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": f"{query} judgment case law",
+        "num": min(max_results, 10),
+    }
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
@@ -222,9 +269,19 @@ def google_legal_search(query: str, max_results: int = 5) -> List[str]:
             if not link:
                 continue
             # filter to legal sites only (simple heuristic)
-            if any(dom in link for dom in ["indiankanoon.org", "sci.gov.in", "judis.nic.in", ".nic.in", "highcourt", "judgement", "judgment", ".gov.in"]):
-                links.append(link)
-            elif link.lower().endswith(".pdf"):
+            if any(
+                dom in link
+                for dom in [
+                    "indiankanoon.org",
+                    "sci.gov.in",
+                    "judis.nic.in",
+                    ".nic.in",
+                    "highcourt",
+                    "judgement",
+                    "judgment",
+                    ".gov.in",
+                ]
+            ):
                 links.append(link)
             if len(links) >= max_results:
                 break
@@ -271,7 +328,12 @@ def sci_fallback_search(query: str, max_results: int = 2) -> List[str]:
         # try simple site-limited Google as last resort if keys exist
         if GOOGLE_API_KEY and GOOGLE_CSE_ID:
             url = "https://www.googleapis.com/customsearch/v1"
-            params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": f"{query} site:main.sci.gov.in filetype:pdf", "num": max_results}
+            params = {
+                "key": GOOGLE_API_KEY,
+                "cx": GOOGLE_CSE_ID,
+                "q": f"{query} site:main.sci.gov.in",
+                "num": max_results,
+            }
             r = requests.get(url, params=params, timeout=8).json()
             links = [it["link"] for it in r.get("items", []) if it.get("link")]
             return links
@@ -279,18 +341,7 @@ def sci_fallback_search(query: str, max_results: int = 2) -> List[str]:
         logger.debug("sci_fallback_search failed")
     return []
 
-# ========== fetch_case_text (HTML pages + PDF) ==========
-def extract_text_from_pdf(path: str) -> str:
-    try:
-        doc = fitz.open(path)
-        text = []
-        for page in doc:
-            text.append(page.get_text())
-        return "\n".join(text).strip()
-    except Exception:
-        logger.exception("extract_text_from_pdf failed for %s", path)
-        return ""
-
+# ========== fetch_case_text (HTML pages only) ==========
 def fetch_case_text(url: str) -> str:
     cache_key = make_key("case_text", url)
     cached = cache_get(cache_key)
@@ -298,40 +349,35 @@ def fetch_case_text(url: str) -> str:
         return cached
     try:
         logger.info("Fetching case text: %s", url)
-        if url.lower().endswith(".pdf"):
-            resp = safe_request(url, timeout=30, allow_proxy_for=["indiankanoon.org", "sci.gov.in"])
-            tmp = f"pdfs/{uuid.uuid4().hex}.pdf"
-            os.makedirs("pdfs", exist_ok=True)
-            with open(tmp, "wb") as fh:
-                fh.write(resp.content)
-            text = extract_text_from_pdf(tmp)
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+        resp = safe_request(
+            url,
+            timeout=20,
+            allow_proxy_for=["indiankanoon.org", "sci.gov.in"],
+        )
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+        # try specific selectors else fallback to paragraphs
+        selectors = soup.select(
+            ".judgment, .judgement, #content, .casebody, .doc, .judgement-body"
+        )
+        nodes = []
+        if selectors:
+            for s in selectors:
+                nodes.append(s.get_text(separator="\n", strip=True))
         else:
-            resp = safe_request(url, timeout=20, allow_proxy_for=["indiankanoon.org"])
-            html = resp.text
-            soup = BeautifulSoup(html, "html.parser")
-            # try specific selectors else fallback to paragraphs
-            selectors = soup.select(".judgment, .judgement, #content, .casebody, .doc, .judgement-body")
-            nodes = []
-            if selectors:
-                for s in selectors:
-                    nodes.append(s.get_text(separator="\n", strip=True))
-            else:
-                paras = soup.find_all("p")
-                for p in paras:
-                    nodes.append(p.get_text(strip=True))
-            text = "\n".join(nodes)
+            paras = soup.find_all("p")
+            for p in paras:
+                nodes.append(p.get_text(strip=True))
+        text = "\n".join(nodes)
         text = text.strip()[:15000]  # limit length
         cache_set(cache_key, text, ttl=60 * 60)
         return text
     except Exception:
         logger.exception("fetch_case_text error for %s", url)
         return ""
+
 # ---------------- PART 3 ----------------
-# NyayaAI — Part 3: OpenAI wrappers, summarizers, ILAC, arguments, compare, scoring, PDF
+# NyayaAI — Part 3: OpenAI wrappers, summarizers, ILAC, arguments, compare, scoring
 # ----------------
 
 # ========== OpenAI wrapper with retries ==========
@@ -369,11 +415,13 @@ async def summarize_case(text: str, query: str) -> Tuple[str, int]:
     if cached:
         return cached
     wait_openai(0.8)
-    system = ("You are a precise Indian legal summarizer. Produce output with lines: "
-              "TITLE: <one-line title>\nSUMMARY: <3-6 lines>\nKEY_FACTS:\n- ...\nAI_SCORE: <0-100>")
+    system = (
+        "You are a precise Indian legal summarizer. Produce output with lines: "
+        "TITLE: <one-line title>\nSUMMARY: <3-6 lines>\nKEY_FACTS:\n- ...\nAI_SCORE: <0-100>"
+    )
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Query: {query}\n\nJudgment text:\n{text[:10000]}"}
+        {"role": "user", "content": f"Query: {query}\n\nJudgment text:\n{text[:10000]}"},
     ]
     resp = await openai_chat(messages)
     out = resp.choices[0].message.content
@@ -400,8 +448,11 @@ async def generate_ilac(query: str, text: str) -> str:
         return cached
     wait_openai(0.7)
     messages = [
-        {"role":"system","content":"You are an Indian law assistant. Write ILAC: ISSUE, LAW, APPLICATION, CONCLUSION. Keep concise."},
-        {"role":"user","content":f"Query: {query}\n\nJudgment text:\n{text[:8000]}"}
+        {
+            "role": "system",
+            "content": "You are an Indian law assistant. Write ILAC: ISSUE, LAW, APPLICATION, CONCLUSION. Keep concise.",
+        },
+        {"role": "user", "content": f"Query: {query}\n\nJudgment text:\n{text[:8000]}"},
     ]
     resp = await openai_chat(messages)
     out = resp.choices[0].message.content
@@ -418,8 +469,11 @@ async def generate_arguments(query: str, text: str) -> str:
         return cached
     wait_openai(0.7)
     messages = [
-        {"role":"system","content":"You are an Indian litigation analyst. Produce PETITIONER ARGUMENTS, RESPONDENT ARGUMENTS, COUNTER ARGUMENTS (concise bullet points)."},
-        {"role":"user","content":f"Query: {query}\n\nJudgment text:\n{text[:8000]}"}
+        {
+            "role": "system",
+            "content": "You are an Indian litigation analyst. Produce PETITIONER ARGUMENTS, RESPONDENT ARGUMENTS, COUNTER ARGUMENTS (concise bullet points).",
+        },
+        {"role": "user", "content": f"Query: {query}\n\nJudgment text:\n{text[:8000]}"},
     ]
     resp = await openai_chat(messages)
     out = resp.choices[0].message.content
@@ -432,8 +486,11 @@ async def compare_case_with_query(query: str, judgment_text: str) -> str:
         return "No judgment text to compare."
     wait_openai(0.6)
     messages = [
-        {"role":"system","content":"You are an Indian legal analyst. Compare QUERY vs JUDGMENT. Output structured: MATCHES:, DIFFERENCES:, IMPACT (1-line)."},
-        {"role":"user","content":f"Query: {query}\n\nJudgment:\n{judgment_text[:9000]}"}
+        {
+            "role": "system",
+            "content": "You are an Indian legal analyst. Compare QUERY vs JUDGMENT. Output structured: MATCHES:, DIFFERENCES:, IMPACT (1-line).",
+        },
+        {"role": "user", "content": f"Query: {query}\n\nJudgment:\n{judgment_text[:9000]}"},
     ]
     resp = await openai_chat(messages)
     return resp.choices[0].message.content
@@ -441,8 +498,11 @@ async def compare_case_with_query(query: str, judgment_text: str) -> str:
 async def extract_legal_issues(query: str) -> str:
     wait_openai(0.6)
     messages = [
-        {"role":"system","content":"You are an Indian lawyer. Extract 3-6 legal issues from the query as court-style questions."},
-        {"role":"user","content":query}
+        {
+            "role": "system",
+            "content": "You are an Indian lawyer. Extract 3-6 legal issues from the query as court-style questions.",
+        },
+        {"role": "user", "content": query},
     ]
     resp = await openai_chat(messages)
     return resp.choices[0].message.content
@@ -453,8 +513,11 @@ async def ask_about_case(question: str, text: str) -> str:
         return "No judgment text provided."
     wait_openai(0.6)
     messages = [
-        {"role":"system","content":"Answer using ONLY the judgment text. If not present, say you cannot find it."},
-        {"role":"user","content":f"Question: {question}\n\nJudgment:\n{text[:10000]}"}
+        {
+            "role": "system",
+            "content": "Answer using ONLY the judgment text. If not present, say you cannot find it.",
+        },
+        {"role": "user", "content": f"Question: {question}\n\nJudgment:\n{text[:10000]}"},
     ]
     resp = await openai_chat(messages)
     return resp.choices[0].message.content
@@ -483,23 +546,6 @@ def compute_relevance_score(ai_score: int, query: str, text: str) -> int:
     total = int((0.6 * ai_score) + (0.3 * keyword_score) + statute_boost)
     return min(total, 100)
 
-# ========== PDF builder ==========
-def build_html_report(query: str, results: List[Dict[str, Any]], ilac: str, arguments: str, citations: str, qna: str = "") -> str:
-    now = time.strftime("%d %b %Y %I:%M %p")
-    header = f'<div style="background:#0f3a63;color:#fff;padding:15px;border-radius:8px;"><h1>NyayaAI</h1><div>AI Legal Research • {now}</div></div>'
-    header += f"<h3>Query: {query}</h3><hr>"
-    body = ""
-    for i, r in enumerate(results, 1):
-        body += f"<h4>Result {i} — Relevance: {r.get('relevance','N/A')}%</h4>"
-        body += f"<p><a href='{r['link']}'>{r['link']}</a></p>"
-        body += f"<pre style='background:#f8f8f8;padding:12px;border-left:4px solid #0f3a63'>{r['summary']}</pre><hr/>"
-    body += "<h3>ILAC</h3><pre>" + (ilac or "Not generated") + "</pre>"
-    body += "<h3>Arguments</h3><pre>" + (arguments or "Not generated") + "</pre>"
-    body += "<h3>Citations</h3><pre>" + (citations or "None") + "</pre>"
-    if qna:
-        body += "<h3>Q&A</h3><pre>" + qna + "</pre>"
-    footer = "<p style='font-size:11px;color:gray'>Generated by NyayaAI — For research only. Not legal advice.</p>"
-    return f"<html><body style='font-family:Arial;margin:18px'>{header}{body}{footer}</body></html>"
 # ---------------- PART 4 ----------------
 # NyayaAI — Part 4: Handlers, Help/FAQ, main(), error handler
 # ----------------
@@ -513,9 +559,7 @@ HELP_TEXT = (
     "• Summaries + AI relevance score\n"
     "• ILAC, Arguments, Citations\n"
     "• Compare your query with judgments (/compare)\n"
-    "• Extract legal issues (/issues)\n"
-    "• Create PDF research reports (/pdf)\n"
-    "• Convert FIR PDF → query → report (/uploadfir)\n\n"
+    "• Extract legal issues (/issues)\n\n"
     "Tap a button below for FAQ, Pricing or Contact."
 )
 
@@ -528,24 +572,55 @@ FAQ_KB = InlineKeyboardMarkup([
 ])
 
 FAQ_TEXTS = {
-    "faq": ("❓ *FAQ*\n\n"
-            "Q: Where does data come from?\nA: Google CSE + Supreme Court + High Courts + IndianKanoon.\n\n"
-            "Q: Is this legal advice?\nA: No — research only.\n\n"
-            "Q: How to use FIR?\nA: Reply to a FIR PDF with /uploadfir."),
-    "pricing": ("💰 *Pricing*\n\nFree tier available. Pro tier will unlock more features and higher rate limits."),
-    "about": ("ℹ️ *About NyayaAI*\n\nNyayaAI is an AI-assisted legal research tool for India. Generates summaries, ILAC, citations and PDF reports."),
-    "contact": ("📞 *Contact*\n\nEmail: support@nyayaai.com\nTelegram: @nyayaai_support"),
-    "feedback": ("✉️ *Feedback*\n\nUse /feedback <your message> to record feedback.")
+    "faq": (
+        "❓ *FAQ*\n\n"
+        "Q: Where does data come from?\n"
+        "A: Google CSE + Supreme Court + High Courts + IndianKanoon.\n\n"
+        "Q: Is this legal advice?\n"
+        "A: No — research only.\n\n"
+        "Q: How to use FIR?\n"
+        "A: FIR document workflows are being integrated and may depend on your custom setup."
+    ),
+    "pricing": (
+        "💰 *Pricing*\n\n"
+        "Free tier available. Pro tier will unlock more features and higher rate limits."
+    ),
+    "about": (
+        "ℹ️ *About NyayaAI*\n\n"
+        "NyayaAI is an AI-assisted legal research tool for India. "
+        "It generates summaries, ILAC, arguments and citations from judgments."
+    ),
+    "contact": (
+        "📞 *Contact*\n\n"
+        "Email: support@nyayaai.com\n"
+        "Telegram: @nyayaai_support"
+    ),
+    "feedback": (
+        "✉️ *Feedback*\n\n"
+        "Use /feedback <your message> to record feedback."
+    ),
 }
 
 # ========== Commands & Handlers ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_usage(update.effective_user.id if update.effective_user else None, "/start")
-    await safe_send(context.bot, update.effective_chat.id, HELP_TEXT, parse_mode="Markdown", reply_markup=FAQ_KB)
+    await safe_send(
+        context.bot,
+        update.effective_chat.id,
+        HELP_TEXT,
+        parse_mode="Markdown",
+        reply_markup=FAQ_KB,
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_usage(update.effective_user.id if update.effective_user else None, "/help")
-    await safe_send(context.bot, update.effective_chat.id, HELP_TEXT, parse_mode="Markdown", reply_markup=FAQ_KB)
+    await safe_send(
+        context.bot,
+        update.effective_chat.id,
+        HELP_TEXT,
+        parse_mode="Markdown",
+        reply_markup=FAQ_KB,
+    )
 
 async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -573,90 +648,24 @@ async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# ========== /pdf handler ==========
-async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else None
-    record_usage(user_id, "/pdf")
-    if not context.args:
-        return await safe_send(context.bot, update.effective_chat.id, "Usage: /pdf <query>\nExample: /pdf IPC 420 cheating")
-    raw = " ".join(context.args)
-    # correct query step (light)
-    try:
-        wait_openai(0.6)
-        corrected_msg = None
-        if client:
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role":"system","content":"Correct and normalize this Indian legal search query (5-8 words). Output only the corrected query."},
-                {"role":"user","content": raw}
-            ])
-            corrected = resp.choices[0].message.content.strip()
-            if corrected and corrected.lower() != raw.lower():
-                corrected_msg = corrected
-    except Exception:
-        corrected = raw
-    q = corrected_msg or raw
-
-    msg = await safe_send(context.bot, update.effective_chat.id, "🔎 Searching case law (GoogleCSE + Kanoon fallback)...")
-    # search
-    links = google_legal_search(q, max_results=3) or search_cases_kanoon(q, max_results=3) or sci_fallback_search(q, max_results=2)
-    if not links:
-        better = None
-        try:
-            if client:
-                wait_openai(0.6)
-                resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                    {"role":"system","content":"Rewrite this weak search query into a stronger Indian Kanoon search query (5-8 words). Output only the improved query."},
-                    {"role":"user","content": q}
-                ])
-                better = resp.choices[0].message.content.strip()
-        except Exception:
-            better = None
-        if better:
-            return await safe_edit(context.bot, update.effective_chat.id, msg.message_id, f"No cases found. Try: `{better}`")
-        return await safe_edit(context.bot, update.effective_chat.id, "No cases found. Try a broader query.")
-
-    await safe_edit(context.bot, update.effective_chat.id, msg.message_id, f"Found {len(links)} results. Summarizing...")
-    # summarize & build report
-    results = []
-    first_text = ""
-    for link in links:
-        text = fetch_case_text(link)
-        first_text = first_text or text
-        summary, ai_score = await summarize_case(text, q)
-        rel = compute_relevance_score(ai_score, q, text)
-        results.append({"link": link, "summary": summary, "ai_score": ai_score, "relevance": rel})
-
-    ilac = await generate_ilac(q, first_text)
-    arguments = await generate_arguments(q, first_text)
-    citations = extract_citations(first_text)
-    qna = ""
-
-    await safe_edit(context.bot, update.effective_chat.id, msg.message_id, "Building PDF report...")
-    os.makedirs("pdfs", exist_ok=True)
-    filename = f"pdfs/nyaya_{uuid.uuid4().hex}.pdf"
-    html = build_html_report(q, results, ilac, arguments, citations, qna)
-    try:
-        pdfkit.from_string(html, filename)
-        USAGE["pdfs"] += 1
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(filename, "rb"))
-        try:
-            os.remove(filename)
-        except:
-            pass
-    except Exception:
-        logger.exception("PDF generation failed")
-        await safe_send(context.bot, update.effective_chat.id, "Failed to generate PDF. Make sure wkhtmltopdf is installed.")
-
 # ========== /compare handler ==========
 async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_usage(update.effective_user.id if update.effective_user else None, "/compare")
     raw = " ".join(context.args) if context.args else ""
     if not raw:
-        return await safe_send(context.bot, update.effective_chat.id, "Usage: /compare <query>")
+        return await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "Usage: /compare <query>",
+        )
     q = raw
     links = google_legal_search(q, max_results=1) or search_cases_kanoon(q, max_results=1)
     if not links:
-        return await safe_send(context.bot, update.effective_chat.id, "No matching judgment found.")
+        return await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "No matching judgment found.",
+        )
     text = fetch_case_text(links[0])
     comparison = await compare_case_with_query(q, text)
     # send in safe chunks
@@ -668,43 +677,14 @@ async def issues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_usage(update.effective_user.id if update.effective_user else None, "/issues")
     raw = " ".join(context.args) if context.args else ""
     if not raw:
-        return await safe_send(context.bot, update.effective_chat.id, "Usage: /issues <query>")
+        return await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "Usage: /issues <query>",
+        )
     issues = await extract_legal_issues(raw)
     for chunk in chunk_text(f"Legal issues:\n{issues}"):
         await safe_send(context.bot, update.effective_chat.id, chunk)
-
-# ========== /uploadfir handler ==========
-async def uploadfir_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    record_usage(update.effective_user.id if update.effective_user else None, "/uploadfir")
-    if not update.message.reply_to_message or not update.message.reply_to_message.document:
-        return await safe_send(context.bot, update.effective_chat.id, "Reply to a FIR PDF with /uploadfir")
-    doc = update.message.reply_to_message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        return await safe_send(context.bot, update.effective_chat.id, "Only PDF is supported.")
-    os.makedirs("pdfs", exist_ok=True)
-    local_path = f"pdfs/{doc.file_id}_{doc.file_name}"
-    try:
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(local_path)
-    except Exception:
-        logger.exception("Failed to download FIR PDF")
-        return await safe_send(context.bot, update.effective_chat.id, "Failed to download FIR PDF.")
-    fir_text = extract_text_from_pdf(local_path)
-    if not fir_text:
-        return await safe_send(context.bot, update.effective_chat.id, "Could not extract text from FIR.")
-    # convert FIR to query
-    try:
-        wait_openai(0.6)
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-            {"role":"system","content":"Read FIR text and return a short (5-8 words) Indian Kanoon search query. Do NOT include names or locations; include IPC sections if present. Output only the query."},
-            {"role":"user","content": fir_text[:8000]}
-        ])
-        smart_query = resp.choices[0].message.content.strip()
-    except Exception:
-        smart_query = " ".join(fir_text.split()[:7])
-    await safe_send(context.bot, update.effective_chat.id, f"Auto query generated:\n`{smart_query}`")
-    context.args = smart_query.split()
-    await pdf_command(update, context)
 
 # ========== Feedback command ==========
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -712,16 +692,32 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_usage(user.id if user else None, "/feedback")
     text = " ".join(context.args) if context.args else ""
     if not text:
-        return await safe_send(context.bot, update.effective_chat.id, "Usage: /feedback <your message>")
+        return await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "Usage: /feedback <your message>",
+        )
     fb_dir = LOG_DIR / "feedback"
     fb_dir.mkdir(exist_ok=True)
     fname = fb_dir / f"fb_{int(time.time())}.txt"
     try:
-        fname.write_text(json.dumps({"user": user.id if user else None, "time": time.time(), "msg": text}))
+        fname.write_text(
+            json.dumps(
+                {
+                    "user": user.id if user else None,
+                    "time": time.time(),
+                    "msg": text,
+                }
+            )
+        )
         await safe_send(context.bot, update.effective_chat.id, "Thanks — feedback recorded.")
     except Exception:
         logger.exception("Feedback save failed")
-        await safe_send(context.bot, update.effective_chat.id, "Failed to record feedback.")
+        await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "Failed to record feedback.",
+        )
 
 # ========== Default message handler ==========
 async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -732,15 +728,25 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await safe_send(context.bot, update.effective_chat.id, "🔎 Searching for judgments...")
     q = raw
-    links = google_legal_search(q, max_results=2) or search_cases_kanoon(q, max_results=2) or sci_fallback_search(q, max_results=2)
+    links = (
+        google_legal_search(q, max_results=2)
+        or search_cases_kanoon(q, max_results=2)
+        or sci_fallback_search(q, max_results=2)
+    )
     if not links:
-        return await safe_send(context.bot, update.effective_chat.id, "No cases found. Try simpler keywords.")
+        return await safe_send(
+            context.bot,
+            update.effective_chat.id,
+            "No cases found. Try simpler keywords.",
+        )
     final = ""
     for link in links:
         txt = fetch_case_text(link)
         summary, score = await summarize_case(txt, q)
         rel = compute_relevance_score(score, q, txt)
-        final += f"{link}\n\n{summary}\n\nRelevance: {rel}%\n\n{'-'*30}\n\n"
+        final += (
+            f"{link}\n\n{summary}\n\nRelevance: {rel}%\n\n{'-' * 30}\n\n"
+        )
     for part in chunk_text(final):
         await safe_send(context.bot, update.effective_chat.id, part)
 
@@ -749,7 +755,11 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.exception("Unhandled error: %s", context.error)
     try:
         if isinstance(update, Update) and update.effective_chat:
-            await safe_send(context.bot, update.effective_chat.id, "⚠️ Something went wrong — the error was logged.")
+            await safe_send(
+                context.bot,
+                update.effective_chat.id,
+                "⚠️ Something went wrong — the error was logged.",
+            )
     except Exception:
         logger.exception("Failed to notify user about error.")
 
@@ -763,13 +773,13 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(faq_callback))
-    app.add_handler(CommandHandler("pdf", pdf_command))
     app.add_handler(CommandHandler("compare", compare_command))
     app.add_handler(CommandHandler("issues", issues_command))
-    app.add_handler(CommandHandler("uploadfir", uploadfir_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
     # default text handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_to_user))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, reply_to_user)
+    )
     app.add_error_handler(global_error_handler)
 
     logger.info("NyayaAI bot is running.")
